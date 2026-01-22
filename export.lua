@@ -1,16 +1,31 @@
 -- =========================================
 -- LogSim (Factorio 2.0) 
--- Export Data to file
+-- Exports protocol, inventory and transaction data to CSV and JSON files.
+-- 
+-- version 0.8.0 first complete working version
+-- version 0.8.1 ring buffer M.TX_MAX_EVENTS load/save secure
+--               ring buffer M.BUFFER_MAX_LINES load/save secure
 --
--- Version 0.6.2 first für LogSim 0.6.2
 -- =========================================
 
 local M = require("config")
 local UI = require("ui")
 local Buffer = require("buffer")
+local Transaction = require("transaction")
+local Util = require("utility")
 
 local Export = {}
-Export.version = "0.6.2"
+Export.version = "0.8.0"
+
+-- Build a JSON-friendly TX array containing ONLY the used portion.
+-- Order is not guaranteed/required (Martin), but we still export in logical (oldest->newest) order for convenience.
+function Export._tx_events_for_json(tx_n)
+  local out = {}
+  for i = 1, tx_n do
+    out[#out+1] = Transaction.tx_get_event(i)
+  end
+  return out
+end
 
 -- Helper: Find element by name in GUI tree
 local function find_by_name(root, target)
@@ -23,37 +38,201 @@ local function find_by_name(root, target)
   return nil
 end
 
--- Sanitize filename
-local function sanitize_filename(s)
-  return (tostring(s):gsub("[^%w%._%-]", "_"))
-end
-
 -- Get filename from dialog
 local function get_export_filename(player)
   local frame = player.gui.screen[M.GUI_EXPORT_FRAME]
   if not (frame and frame.valid) then 
-    return sanitize_filename(M.EXPORT_DEFAULT_NAME)
+    return Util.sanitize_filename(M.EXPORT_DEFAULT_NAME)
   end
   
   local field = find_by_name(frame, M.GUI_EXPORT_FILENAME)
   if not (field and field.valid) then
-    return sanitize_filename(M.EXPORT_DEFAULT_NAME)
+    return Util.sanitize_filename(M.EXPORT_DEFAULT_NAME)
   end
   
   local name = field.text or ""
   if name == "" then
-    return sanitize_filename(M.EXPORT_DEFAULT_NAME)
+    return Util.sanitize_filename(M.EXPORT_DEFAULT_NAME)
   end
   
-  return sanitize_filename(name)
+  return Util.sanitize_filename(name)
+end
+
+-- =========================================
+-- TX EXPORT (CSV) – uses TX viewer lines
+-- =========================================
+function Export.export_tx_csv(player)
+  Buffer.ensure_defaults()
+
+  local tx_n = (Transaction.tx_line_count() or 0)
+  if tx_n == 0 then
+    player.print({"logistics_simulation.export_no_data"})
+    return
+  end
+
+  local filename = get_export_filename(player)
+  local filepath = M.EXPORT_FOLDER .. "/" .. filename .. ".csv"
+
+  local surface = player.surface
+
+  -- Build exactly the same lines as the TX viewer
+  local total_lines = tx_n + 2
+  local lines = {}
+
+  for i = 1, total_lines do
+    local line = Transaction.tx_get_line(i, surface)
+    if line then
+      lines[#lines+1] = line
+    end
+  end
+
+  local content = table.concat(lines, "\n")
+
+  local ok, err = pcall(function()
+    helpers.write_file(filepath, content)
+  end)
+
+  if ok then
+    player.print({"logistics_simulation.export_success", filepath, line_count})
+  else
+    player.print({"logistics_simulation.export_failed", tostring(err)})
+  end
+
+  UI.close_export_dialog(player)
+end
+
+-- =========================================
+-- TX EXPORT (JSON) – raw tx_events + metadata
+-- =========================================
+function Export.export_tx_json(player)
+  Buffer.ensure_defaults()
+
+  local tx_n = (Transaction.tx_line_count() or 0)
+  if tx_n == 0 then
+    player.print({"logistics_simulation.export_no_data"})
+    return
+  end
+
+  local filename = get_export_filename(player)
+  local filepath = M.EXPORT_FOLDER .. "/" .. filename .. ".json"
+
+  local data = {
+    metadata = {
+      mod_version   = get_logger_version(),
+      run_name      = storage.run_name or "unnamed",
+      start_tick    = storage.run_start_tick or 0,
+      export_tick   = game.tick,
+      event_count   = tx_n,
+      kind          = "transactions"
+    },
+    tx_events = Export._tx_events_for_json(tx_n)
+  }
+
+  local json_str = Export.table_to_json(data)
+
+  local ok, err = pcall(function()
+    helpers.write_file(filepath, json_str)
+  end)
+
+  if ok then
+    player.print({"logistics_simulation.export_success", filepath, tx_n})
+  else
+    player.print({"logistics_simulation.export_failed", tostring(err)})
+  end
+
+  UI.close_export_dialog(player)
+end
+
+
+-- =========================================
+-- INV EXPORT 
+-- =========================================
+
+local function get_inv_text(player)
+  local frame = player.gui.screen[M.GUI_INV_FRAME]
+  if not (frame and frame.valid) then return nil end
+  local box = frame[M.GUI_INV_BOX]
+  if not (box and box.valid) then return nil end
+  local txt = box.text or ""
+  if txt == "" then return nil end
+  return txt
+end
+
+function Export.export_inv_csv(player)
+  Buffer.ensure_defaults()
+
+  local txt = get_inv_text(player)
+  if not txt then
+    player.print({"logistics_simulation.export_no_data"})
+    return
+  end
+
+  local filename = get_export_filename(player)
+  local filepath = M.EXPORT_FOLDER .. "/" .. filename .. ".csv"
+
+  local success, err = pcall(function()
+    helpers.write_file(filepath, txt)
+  end)
+
+  if success then
+    player.print({"logistics_simulation.export_success", filepath, 1})
+  else
+    player.print({"logistics_simulation.export_failed", tostring(err)})
+  end
+
+  UI.close_export_dialog(player)
+end
+
+function Export.export_inv_json(player)
+  Buffer.ensure_defaults()
+
+  local txt = get_inv_text(player)
+  if not txt then
+    player.print({"logistics_simulation.export_no_data"})
+    return
+  end
+
+  local filename = get_export_filename(player)
+  local filepath = M.EXPORT_FOLDER .. "/" .. filename .. ".json"
+
+  local lines = {}
+  for line in string.gmatch(txt, "([^\n]+)") do
+    lines[#lines+1] = line
+  end
+
+  local data = {
+    metadata = {
+      mod_version = get_logger_version(),
+      run_name = storage.run_name or "unnamed",
+      start_tick = storage.run_start_tick or 0,
+      export_tick = game.tick,
+      kind = "inventory"
+    },
+    inventory_text = txt,
+    inventory_lines = lines
+  }
+
+  local json_str = Export.table_to_json(data)
+
+  local success, err = pcall(function()
+    helpers.write_file(filepath, json_str)
+  end)
+
+  if success then
+    player.print({"logistics_simulation.export_success", filepath, #lines})
+  else
+    player.print({"logistics_simulation.export_failed", tostring(err)})
+  end
+
+  UI.close_export_dialog(player)
 end
 
 -- Export as CSV (raw protocol format)
 function Export.export_csv(player)
   Buffer.ensure_defaults()
   
-  local lines = storage.buffer_lines or {}
-  if #lines == 0 then
+  local lines, line_count = Buffer.snapshot_lines()
+  if line_count == 0 then
     player.print({"logistics_simulation.export_no_data"})
     return
   end
@@ -81,8 +260,8 @@ end
 function Export.export_json(player)
   Buffer.ensure_defaults()
   
-  local lines = storage.buffer_lines or {}
-  if #lines == 0 then
+  local lines, line_count = Buffer.snapshot_lines()
+  if line_count == 0 then
     player.print({"logistics_simulation.export_no_data"})
     return
   end
@@ -94,7 +273,7 @@ function Export.export_json(player)
       run_name = storage.run_name or "unnamed",
       start_tick = storage.run_start_tick or 0,
       export_tick = game.tick,
-      line_count = #lines,
+      line_count = line_count,
       sample_interval = storage.sample_interval or M.SAMPLE_INTERVAL_TICKS
     },
     registrations = {
